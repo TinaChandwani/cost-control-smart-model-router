@@ -1,4 +1,4 @@
-# Cost-Control Smart Model Router
+# Distributed LLM Inference Platform
 
 ## Overview
 Cost-Control Smart Model Router is an intelligent routing system designed to optimize the usage of large language models (LLMs) based on cost, performance, and task complexity. 
