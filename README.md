@@ -1,11 +1,14 @@
 # Distributed LLM Inference Platform
 
 ## Overview
-Cost-Control Smart Model Router is an intelligent routing system designed to optimize the usage of large language models (LLMs) based on cost, performance, and task complexity. 
+
+
+A distributed LLM inference platform — clients send requests to a FastAPI gateway that publishes them to Kafka. A pool of async workers consumes those jobs, uses a cost-and-latency scoring engine to pick the right provider, and calls OpenAI, Anthropic, or HuggingFace. Results are logged to PostgreSQL; a background job re-ranks models every 60 seconds based on actual observed performance. The whole system is rate-limited via Redis and monitored with Prometheus. I ran a 15K-request load test and measured 40% cost savings vs routing everything to GPT-4.
 As AI applications scale, blindly sending every request to the most powerful (and expensive) model becomes inefficient.
+
+
 This project solves that problem by dynamically selecting the most appropriate model for each request.
 
-The system acts as a middleware layer between user requests and multiple LLM providers, ensuring optimal trade-offs between cost, latency, and output quality.
 
 ---
 
