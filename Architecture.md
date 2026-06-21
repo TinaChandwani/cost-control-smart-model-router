@@ -9,23 +9,15 @@ This document explains the design of this system — not just *what* was built, 
 1. [Problem Statement](#1-problem-statement)
 2. [Design Questions and Decisions](#2-design-questions-and-decisions)
 3. [System Architecture](#3-system-architecture)
-4. [Component Deep Dives](#4-component-deep-dives)
-   - [Database Design](#41-database-design)
-   - [Decision Engine](#42-decision-engine)
-   - [Background Optimizer](#43-background-optimizer)
-   - [Provider Layer](#44-provider-layer)
-   - [Observability](#45-observability)
-5. [Request Lifecycle](#5-request-lifecycle)
-6. [Trade-offs and What I'd Change at Scale](#6-trade-offs-and-what-id-change-at-scale)
-7. [Phase 2 Roadmap](#7-phase-2-roadmap)
+4. [Request Lifecycle](#5-request-lifecycle)
+5. [Trade-offs and What I'd Change at Scale](#6-trade-offs-and-what-id-change-at-scale)
+6. [Phase 2 Roadmap](#7-phase-2-roadmap)
 
 ---
 
 ## 1. Problem Statement
 
 > "Build a system that routes LLM inference requests across multiple providers, optimizing for cost and latency."
-
-That statement is deliberately vague. The first job of a systems engineer is to make it concrete before touching code. The section below documents every question asked, the answer chosen for this project, and why that answer shaped the design.
 
 ---
 
@@ -200,170 +192,6 @@ A: A failed provider call logs `success=False`, returns a 502 to the caller, and
 │  GET /debug/scores  →  live model leaderboard               │
 └─────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## 4. Component Deep Dives
-
-### 4.1 Database Design
-
-Two tables. The split is deliberate.
-
-**`request_logs`** — append-only. One row per inference call. Never updated after insert.
-
-```sql
-id                UUID        primary key
-provider          TEXT        "openai" | "anthropic" | "huggingface"
-model             TEXT        "gpt-3.5-turbo" | "claude-haiku-4-5" | ...
-prompt_tokens     INTEGER
-completion_tokens INTEGER
-latency_ms        FLOAT
-cost_usd          FLOAT
-success           BOOLEAN
-error_message     TEXT        null on success
-routed_at         TIMESTAMP
-```
-
-*Why append-only?* Logs are a record of what happened. Mutating them would destroy the audit trail the optimizer relies on. Every row is immutable history.
-
-**`routing_policies`** — one row per model, rewritten every 60 seconds by the optimizer.
-
-```sql
-model               TEXT    primary key
-provider            TEXT
-avg_latency_ms      FLOAT   computed from request_logs
-p95_latency_ms      FLOAT   computed from request_logs
-cost_per_1k_tokens  FLOAT   from cost table (static)
-success_rate        FLOAT   computed from request_logs
-request_count       INTEGER
-updated_at          TIMESTAMP
-```
-
-*Why separate tables?* The decision engine reads `routing_policies` on every single request — it needs to be fast. If the engine queried `request_logs` directly, every request would trigger a full aggregation query over potentially millions of rows. `routing_policies` is a pre-aggregated cache: the optimizer does the expensive computation on a schedule so the hot path stays cheap.
-
-This is the read/write separation pattern: slow writes (optimizer, every 60s) feed fast reads (decision engine, every request).
-
----
-
-### 4.2 Decision Engine
-
-**The scoring formula:**
-
-```
-score = α × latency_score + β × cost_score + γ × reliability_score
-```
-
-Where:
-```
-latency_score     = 1 - (model_p95 / worst_p95_across_all_models)
-cost_score        = 1 - (model_cost / most_expensive_model)
-reliability_score = model_success_rate
-```
-
-**Why normalize to [0, 1]?** Latency is measured in milliseconds (200, 800, 2000...) and cost is measured in dollars per 1K tokens (0.0001, 0.005...). These are different units on completely different scales. Without normalization, whichever dimension has larger raw numbers would dominate the score regardless of the weights. Normalizing each dimension to [0, 1] makes the weights meaningful: α=0.6 genuinely means "I care 60% about latency."
-
-**Why p95 latency instead of average?**
-
-Average latency is a misleading metric for user-facing systems. A model with 200ms average could have 5,000ms p95 — meaning 1 in 20 users waits 5 seconds. p95 is what the slowest reasonable user experiences. Optimizing for p95 protects the tail, not just the median.
-
-**Why those specific weights?**
-
-```python
-WEIGHTS = {
-    "cost":     (α=0.2, β=0.6, γ=0.2),  # cost drives 60% of score
-    "latency":  (α=0.6, β=0.2, γ=0.2),  # latency drives 60% of score
-    "balanced": (α=0.33, β=0.33, γ=0.34) # equal weight, reliability as tiebreaker
-}
-```
-
-These are intentionally simple starting points. In production, you'd A/B test different weight configurations and measure outcomes (user satisfaction, cost per session) to tune them. The architecture supports this — changing weights is a one-line config change, not a code change.
-
-**Why include reliability at all?**
-
-A model with great latency and great cost that fails 20% of the time is not a good model. Without a reliability term, the score would keep routing to it. The `success_rate` term ensures that a degrading provider gets down-ranked automatically as failures accumulate in `request_logs`.
-
----
-
-### 4.3 Background Optimizer
-
-**Why 60 seconds?**
-
-Three competing concerns:
-- *Freshness:* if a provider degrades, how quickly should routing react?
-- *Cost:* running aggregation queries on `request_logs` isn't free
-- *Stability:* updating routing policies too frequently causes oscillation (constantly switching providers)
-
-60 seconds is a practical middle ground. Fast enough to react to real incidents within one minute. Cheap enough not to add meaningful load to PostgreSQL. Stable enough that the routing doesn't thrash between providers on every request.
-
-**Why the last 500 requests?**
-
-Two reasons. First, recency: a provider that was slow at 2am but fast at 2pm should be scored on the 2pm data. All-time averages would dilute recent signal with stale history. Second, a bounded window keeps the query cost predictable regardless of total request volume.
-
-**Why require at least 5 samples before updating a model's policy?**
-
-With fewer than 5 data points, a single outlier (one very slow request, one error) would wildly distort the score. The seed values (500ms avg, 800ms p95, 100% success) are conservative defaults that keep every model in contention while real data accumulates. Once 5 samples exist, real data takes over.
-
-**The feedback loop:**
-
-```
-request arrives
-     ↓
-decision engine picks model from routing_policies
-     ↓
-provider call completes (or fails)
-     ↓
-result written to request_logs
-     ↓
-(every 60s) optimizer reads request_logs
-     ↓
-optimizer rewrites routing_policies
-     ↓
-next request uses updated scores
-```
-
-This is a closed-loop control system. The router's own traffic is the signal that improves future routing decisions.
-
----
-
-### 4.4 Provider Layer
-
-**Why a uniform return shape across all providers?**
-
-```python
-{
-    "text":              str,
-    "prompt_tokens":     int,
-    "completion_tokens": int,
-    "model":             str,
-    "provider":          str,
-}
-```
-
-Each provider's API returns completely different response shapes. OpenAI uses `response.choices[0].message.content`. Anthropic uses `response.content[0].text`. HuggingFace returns a list. If the router handled these differences inline, every provider change would require touching the routing logic.
-
-The provider layer absorbs all that variation and hands the router a consistent dict. The router never needs to know which provider it's talking to — it just uses the dict.
-
-**Why estimate token counts for HuggingFace?**
-
-HuggingFace's Inference API doesn't return token usage in its response. The estimate (`len(text) / 4`) is a well-known approximation: English text averages roughly 4 characters per token. It's not exact, but it's close enough for cost estimation. In production, you'd use a tokenizer library (`tiktoken` for OpenAI models, `transformers` for others) to get exact counts.
-
----
-
-### 4.5 Observability
-
-**Four metrics and why each one:**
-
-`llm_router_requests_total{provider, model, status}` — a counter. Answers: "how many requests went to each model?" and "what's the error rate per provider?" The `status` label (success/error) lets you compute error rate as a ratio without a separate metric.
-
-`llm_router_latency_ms{provider, model}` — a histogram. Histograms automatically compute p50, p95, p99 from bucket counts. This is more efficient than storing raw latency values and computing percentiles at query time.
-
-`llm_router_cost_usd_total{provider, model}` — a counter. Answers: "how much have we spent on each model?" This is the number that proves the "40% cost savings" claim in the load test.
-
-`llm_router_routing_decisions_total{priority}` — a counter. Answers: "how often do callers use cost vs latency vs balanced priority?" Useful for understanding how the system is actually being used, which informs whether the weight defaults are right.
-
-**Why Prometheus + Grafana over just logging?**
-
-Logs are good for debugging individual requests. Metrics are good for understanding system behavior over time. "What was the p95 latency for Anthropic between 2pm and 3pm last Tuesday?" is a 10-second Grafana query. Answering the same question from logs requires parsing potentially millions of log lines. Both have their place — this system has both.
 
 ---
 
